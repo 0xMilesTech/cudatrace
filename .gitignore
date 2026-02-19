@@ -1,0 +1,15 @@
+# Large reference repo (kept for local lookup only)
+open-gpu-kernel-modules/
+
+# Local outputs and build artifacts
+*.output
+*.output.tid-*
+cudatrace.output.tid-*
+sample/cudatrace.output.tid-*
+target/
+
+# Sample generated binaries/artifacts
+sample/cudart
+sample/driverapi
+sample/vector_add.ptx
+sample/driver.trace.tid-*
