@@ -70,6 +70,23 @@ LD_PRELOAD=../target/debug/libcudatrace.so ./driverapi
   - `ts` / `timestamp`
   - `tid,ts`
   - when enabled, output lines get a left prefix like `tid=12345 ts=1739950000000000us  |  ...`
+- `LIB_CUDATRACE_FGRAPH_FUNCS`:
+  - optional comma-separated exact function names (case-sensitive)
+  - function names must match hooked user-space API symbols (current wrappers)
+  - `cudaMallocHost` and `cudaHostAlloc` are treated as aliases for matching
+  - when set, function-graph capture is enabled inside the matched function enter/return window
+  - each syscall in the window writes one file:
+    - `<LIB_CUDATRACE_PATH>.fgraph.tid-<tid>.ts-<entry_us>.<user_func><enter_seq>.sys-<syscall>.log`
+    - example: `...ts-1771720262318942.cudaMalloc2.sys-ioctl.log`
+  - each fgraph file header includes `syscall_enter=...` with syscall arguments for matching
+  - fgraph capture sets `set_graph_function=__x64_sys_<syscall>` to reduce unrelated head/tail kernel frames
+  - requires `LIB_CUDATRACE_TRACE` to include `syscall`
+  - requires tracefs write permissions (`/sys/kernel/tracing` or `/sys/kernel/debug/tracing`)
+  - if this variable is set but tracefs/function_graph is unavailable, the process exits with error
+- `LIB_CUDATRACE_FGRAPH_BUFFER_KB`:
+  - per-CPU function-graph ring buffer size in KiB
+  - default `16384` (16 MiB per CPU)
+  - increase this when very long `ioctl` traces appear truncated (e.g. missing upper-half call entries)
 - `LIB_CUDATRACE_PTRACE_DEBUG`:
   - optional debug logs (`1/true/yes/on`)
 
@@ -90,3 +107,13 @@ Notes for ptrace syscall tracing:
 - Syscall trace output is produced by the built-in `ptrace` path.
 - Output format follows syscall line style: `name(args) = ret  /* time */`.
 - Requires kernel ptrace permission (Yama/LSM settings may affect availability).
+
+When root permissions are required for tracefs, avoid preloading into `sudo` itself.
+Run the target under a root shell so `LD_PRELOAD` applies to the target process:
+
+```bash
+sudo sh -c 'LD_PRELOAD=/abs/path/to/libcudatrace.so \
+LIB_CUDATRACE_TRACE=cudart,driver,syscall \
+LIB_CUDATRACE_FGRAPH_FUNCS=cudaMallocHost \
+./sample/cudart'
+```

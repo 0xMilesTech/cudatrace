@@ -28,7 +28,7 @@ int main() {
     return 1;
   }
   close(fd);
-
+  cudaFree(0);
   const int N = 1 << 20;
   const size_t bytes = N * sizeof(float);
   // 1) Pinned host allocations (cudaMallocHost)

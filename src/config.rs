@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::sync::LazyLock;
 
@@ -8,10 +9,15 @@ const ENV_IOCTL_DECODE: &str = "LIB_CUDATRACE_IOCTL_DECODE";
 const ENV_MAX_BLOB: &str = "LIB_CUDATRACE_MAX_BLOB";
 const ENV_TIME_UNIT: &str = "LIB_CUDATRACE_TIME_UNIT";
 const ENV_LEFT_META: &str = "LIB_CUDATRACE_LEFT_META";
+const ENV_FGRAPH_FUNCS: &str = "LIB_CUDATRACE_FGRAPH_FUNCS";
+const ENV_FGRAPH_BUFFER_KB: &str = "LIB_CUDATRACE_FGRAPH_BUFFER_KB";
 
 const DEFAULT_PATH: &str = "./cudatrace.output";
 const DEFAULT_MAX_BLOB: usize = 256;
 const MAX_BLOB_CAP: usize = 64 * 1024;
+const DEFAULT_FGRAPH_BUFFER_KB: usize = 16 * 1024;
+const MIN_FGRAPH_BUFFER_KB: usize = 64;
+const MAX_FGRAPH_BUFFER_KB: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -95,6 +101,8 @@ pub struct Config {
     pub max_blob: usize,
     pub time_unit: TimeUnit,
     pub left_meta: LeftMetaMode,
+    pub fgraph_funcs: HashSet<String>,
+    pub fgraph_buffer_kb: usize,
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(Config::from_process_env);
@@ -112,6 +120,14 @@ impl Config {
         self.trace.enabled_for(domain)
     }
 
+    pub fn fgraph_enabled(&self) -> bool {
+        !self.fgraph_funcs.is_empty()
+    }
+
+    pub fn fgraph_match(&self, func: &str) -> bool {
+        self.fgraph_funcs.contains(func)
+    }
+
     fn from_lookup<F>(lookup: F) -> Self
     where
         F: Fn(&str) -> Option<String>,
@@ -126,6 +142,8 @@ impl Config {
         let max_blob = parse_max_blob(lookup(ENV_MAX_BLOB).as_deref());
         let time_unit = parse_time_unit(lookup(ENV_TIME_UNIT).as_deref());
         let left_meta = parse_left_meta(lookup(ENV_LEFT_META).as_deref());
+        let fgraph_funcs = parse_fgraph_funcs(lookup(ENV_FGRAPH_FUNCS).as_deref());
+        let fgraph_buffer_kb = parse_fgraph_buffer_kb(lookup(ENV_FGRAPH_BUFFER_KB).as_deref());
 
         Self {
             output,
@@ -135,6 +153,8 @@ impl Config {
             max_blob,
             time_unit,
             left_meta,
+            fgraph_funcs,
+            fgraph_buffer_kb,
         }
     }
 }
@@ -236,6 +256,41 @@ fn normalize(input: &str) -> String {
     input.trim().to_ascii_lowercase()
 }
 
+fn parse_fgraph_funcs(value: Option<&str>) -> HashSet<String> {
+    let Some(raw) = value else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        out.insert(token.to_owned());
+        // CUDA runtime may resolve cudaMallocHost calls via cudaHostAlloc wrappers.
+        // Treat them as aliases for fgraph function-window matching.
+        match token {
+            "cudaMallocHost" => {
+                out.insert("cudaHostAlloc".to_owned());
+            }
+            "cudaHostAlloc" => {
+                out.insert("cudaMallocHost".to_owned());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn parse_fgraph_buffer_kb(value: Option<&str>) -> usize {
+    let parsed = value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FGRAPH_BUFFER_KB);
+    parsed.clamp(MIN_FGRAPH_BUFFER_KB, MAX_FGRAPH_BUFFER_KB)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +312,8 @@ mod tests {
         assert_eq!(cfg.max_blob, 256);
         assert_eq!(cfg.time_unit, TimeUnit::Us);
         assert_eq!(cfg.left_meta, LeftMetaMode::Off);
+        assert!(cfg.fgraph_funcs.is_empty());
+        assert_eq!(cfg.fgraph_buffer_kb, DEFAULT_FGRAPH_BUFFER_KB);
     }
 
     #[test]
@@ -287,6 +344,8 @@ mod tests {
         assert_eq!(cfg.max_blob, 256);
         assert_eq!(cfg.time_unit, TimeUnit::Us);
         assert_eq!(cfg.left_meta, LeftMetaMode::Off);
+        assert!(cfg.fgraph_funcs.is_empty());
+        assert_eq!(cfg.fgraph_buffer_kb, DEFAULT_FGRAPH_BUFFER_KB);
     }
 
     #[test]
@@ -306,5 +365,42 @@ mod tests {
 
         map.insert(ENV_LEFT_META, "off");
         assert_eq!(parse_from_map(&map).left_meta, LeftMetaMode::Off);
+    }
+
+    #[test]
+    fn parse_fgraph_funcs_list() {
+        let mut map = HashMap::new();
+        map.insert(ENV_FGRAPH_FUNCS, "cudaMalloc, cuInit , cudaMalloc,");
+
+        let cfg = parse_from_map(&map);
+        assert!(cfg.fgraph_enabled());
+        assert!(cfg.fgraph_match("cudaMalloc"));
+        assert!(cfg.fgraph_match("cuInit"));
+        assert!(!cfg.fgraph_match("cudaFree"));
+        assert_eq!(cfg.fgraph_funcs.len(), 2);
+    }
+
+    #[test]
+    fn parse_fgraph_funcs_adds_cuda_host_alloc_aliases() {
+        let mut map = HashMap::new();
+        map.insert(ENV_FGRAPH_FUNCS, "cudaMallocHost");
+
+        let cfg = parse_from_map(&map);
+        assert!(cfg.fgraph_match("cudaMallocHost"));
+        assert!(cfg.fgraph_match("cudaHostAlloc"));
+    }
+
+    #[test]
+    fn parse_fgraph_buffer_kb_range() {
+        let mut map = HashMap::new();
+
+        map.insert(ENV_FGRAPH_BUFFER_KB, "32768");
+        assert_eq!(parse_from_map(&map).fgraph_buffer_kb, 32768);
+
+        map.insert(ENV_FGRAPH_BUFFER_KB, "0");
+        assert_eq!(parse_from_map(&map).fgraph_buffer_kb, MIN_FGRAPH_BUFFER_KB);
+
+        map.insert(ENV_FGRAPH_BUFFER_KB, "999999999");
+        assert_eq!(parse_from_map(&map).fgraph_buffer_kb, MAX_FGRAPH_BUFFER_KB);
     }
 }

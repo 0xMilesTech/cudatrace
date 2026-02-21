@@ -154,12 +154,12 @@ fn duration_for_config(duration: Duration) -> (u128, &'static str) {
 }
 
 fn format_open_line(depth: usize, func: &'static str, args: &str) -> String {
-    let indent = "  ".repeat(depth);
+    let indent = "\t".repeat(depth);
     format!("{indent}{func}({args}) {{")
 }
 
 fn format_close_line(depth: usize, ret: &str, elapsed_value: u128, elapsed_unit: &str) -> String {
-    let indent = "  ".repeat(depth);
+    let indent = "\t".repeat(depth);
     format!("{indent}}} = {ret}  /* {elapsed_value} {elapsed_unit} */")
 }
 
@@ -171,7 +171,7 @@ fn format_leaf_line(
     elapsed_value: u128,
     elapsed_unit: &str,
 ) -> String {
-    let indent = "  ".repeat(depth);
+    let indent = "\t".repeat(depth);
     format!("{indent}{func}({args}) = {ret}  /* {elapsed_value} {elapsed_unit} */")
 }
 
@@ -205,8 +205,8 @@ mod tests {
         let leaf = format_leaf_line(1, "close", "fd=7", "0", 5, "us");
         let close = format_close_line(1, "304", 1572, "us");
 
-        assert_eq!(open, "  cudaHostAlloc(ptr=0x1, size=64, flags=0x0) {");
-        assert_eq!(leaf, "  close(fd=7) = 0  /* 5 us */");
-        assert_eq!(close, "  } = 304  /* 1572 us */");
+        assert_eq!(open, "\tcudaHostAlloc(ptr=0x1, size=64, flags=0x0) {");
+        assert_eq!(leaf, "\tclose(fd=7) = 0  /* 5 us */");
+        assert_eq!(close, "\t} = 304  /* 1572 us */");
     }
 }

@@ -2,14 +2,14 @@ use crate::config::{OutputMode, TimeUnit, global};
 use crate::decode::ioctl::{set_decode_target_pid, summarize_ioctl};
 use crate::dlsym::resolve_next_from_ptr;
 use crate::line_meta::{current_tid, now_timestamp_for_config, prepend_left_meta};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 type pid_t = i32;
 
@@ -135,10 +135,14 @@ const SYS_PPOLL: i64 = 271;
 const SYS_PSELECT6: i64 = 270;
 const SYS_FACCESSAT: i64 = 269;
 const SYS_DUP3: i64 = 292;
+const FGRAPH_WINDOW_EVENT_EXIT: u8 = 0;
+const FGRAPH_WINDOW_EVENT_ENTER: u8 = 1;
+const FGRAPH_FUNC_NAME_MAX: usize = 96;
 
 static START: Once = Once::new();
 static IN_TRACER_PROCESS: AtomicBool = AtomicBool::new(false);
 static DEPTH_PIPE_WR_FD: AtomicI32 = AtomicI32::new(-1);
+static FGRAPH_WINDOW_PIPE_WR_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -181,6 +185,9 @@ struct SyscallState {
     path_hint: Option<String>,
     started_ts: u128,
     started_at: Instant,
+    started_ts_us: u128,
+    fgraph_waiting: bool,
+    fgraph_capturing: bool,
 }
 
 impl Default for SyscallState {
@@ -193,6 +200,9 @@ impl Default for SyscallState {
             path_hint: None,
             started_ts: 0,
             started_at: Instant::now(),
+            started_ts_us: 0,
+            fgraph_waiting: false,
+            fgraph_capturing: false,
         }
     }
 }
@@ -208,6 +218,70 @@ struct FusedWriter {
 struct DepthUpdate {
     tid: i32,
     depth: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FgraphWindowUpdate {
+    tid: i32,
+    depth: u32,
+    seq: u32,
+    event: u8,
+    _reserved: [u8; 3],
+    func: [u8; FGRAPH_FUNC_NAME_MAX],
+}
+
+impl Default for FgraphWindowUpdate {
+    fn default() -> Self {
+        Self {
+            tid: 0,
+            depth: 0,
+            seq: 0,
+            event: FGRAPH_WINDOW_EVENT_EXIT,
+            _reserved: [0; 3],
+            func: [0; FGRAPH_FUNC_NAME_MAX],
+        }
+    }
+}
+
+impl FgraphWindowUpdate {
+    fn set_func(&mut self, func: &str) {
+        self.func.fill(0);
+        let src = func.as_bytes();
+        let copy_len = src.len().min(self.func.len());
+        self.func[..copy_len].copy_from_slice(&src[..copy_len]);
+    }
+
+    fn func_name(&self) -> String {
+        let len = self
+            .func
+            .iter()
+            .position(|&value| value == 0)
+            .unwrap_or(self.func.len());
+        String::from_utf8_lossy(&self.func[..len]).into_owned()
+    }
+}
+
+#[derive(Clone)]
+struct FgraphScopeLabel {
+    func: String,
+    seq: u32,
+}
+
+#[derive(Default)]
+struct FgraphWindowState {
+    depth: usize,
+    labels: Vec<FgraphScopeLabel>,
+}
+
+#[derive(Clone)]
+struct ActiveFgraphCapture {
+    tid: pid_t,
+    syscall_name: String,
+    graph_function: Option<String>,
+    syscall_enter: String,
+    entry_ts_us: u128,
+    scope_label: String,
 }
 
 impl FusedWriter {
@@ -409,12 +483,78 @@ pub fn publish_graph_depth(depth: usize) {
     }
 }
 
+pub fn publish_fgraph_window_enter(depth: usize, func: &str, seq: u32) {
+    let mut msg = FgraphWindowUpdate {
+        tid: current_tid(),
+        depth: depth.min(u32::MAX as usize) as u32,
+        seq,
+        event: FGRAPH_WINDOW_EVENT_ENTER,
+        ..Default::default()
+    };
+    msg.set_func(func);
+    publish_fgraph_window_update(&msg);
+}
+
+pub fn publish_fgraph_window_exit(depth: usize) {
+    let msg = FgraphWindowUpdate {
+        tid: current_tid(),
+        depth: depth.min(u32::MAX as usize) as u32,
+        seq: 0,
+        event: FGRAPH_WINDOW_EVENT_EXIT,
+        ..Default::default()
+    };
+    publish_fgraph_window_update(&msg);
+}
+
+fn publish_fgraph_window_update(msg: &FgraphWindowUpdate) {
+    if is_internal_tracer() || !global().trace.syscall || !global().fgraph_enabled() {
+        return;
+    }
+
+    let fd = FGRAPH_WINDOW_PIPE_WR_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+
+    let bytes = fgraph_window_update_as_bytes(msg);
+    let written = call_real_write(fd, bytes.as_ptr().cast::<crate::ffi::c_void>(), bytes.len());
+    if written == bytes.len() as isize {
+        return;
+    }
+    if written < 0 {
+        let err = last_errno();
+        if err == EBADF || err == EPIPE {
+            if FGRAPH_WINDOW_PIPE_WR_FD
+                .compare_exchange(fd, -1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let _ = call_real_close(fd);
+            }
+        }
+    }
+}
+
 pub fn ensure_started() {
     if is_internal_tracer() {
         return;
     }
     START.call_once(|| {
         let cfg = global();
+        if cfg.fgraph_enabled() && !cfg.trace.syscall {
+            fatal_exit(
+                "LIB_CUDATRACE_FGRAPH_FUNCS requires syscall tracing; include `syscall` in LIB_CUDATRACE_TRACE",
+            );
+        }
+        if cfg.fgraph_enabled() {
+            match crate::hook::fgraph::preflight() {
+                Ok(()) => {}
+                Err(err) => {
+                    fatal_exit(&format!(
+                        "LIB_CUDATRACE_FGRAPH_FUNCS is set but tracefs function_graph is unavailable: {err}"
+                    ));
+                }
+            }
+        }
         if !cfg.trace.syscall {
             debug_log("ptrace disabled by config");
             return;
@@ -445,6 +585,16 @@ unsafe fn spawn_ptrace_tracer() {
         let _ = call_real_close(fds[1]);
         return;
     }
+    let mut fgraph_window_fds = [0_i32; 2];
+    // SAFETY: fgraph_window_fds points to two valid ints.
+    if unsafe { pipe(fgraph_window_fds.as_mut_ptr()) } != 0 {
+        debug_log_errno("fgraph window pipe failed");
+        let _ = call_real_close(fds[0]);
+        let _ = call_real_close(fds[1]);
+        let _ = call_real_close(depth_fds[0]);
+        let _ = call_real_close(depth_fds[1]);
+        return;
+    }
 
     // SAFETY: fork creates tracer child for ptrace loop.
     let child = unsafe { fork() };
@@ -454,6 +604,8 @@ unsafe fn spawn_ptrace_tracer() {
         let _ = call_real_close(fds[1]);
         let _ = call_real_close(depth_fds[0]);
         let _ = call_real_close(depth_fds[1]);
+        let _ = call_real_close(fgraph_window_fds[0]);
+        let _ = call_real_close(fgraph_window_fds[1]);
         return;
     }
 
@@ -462,20 +614,34 @@ unsafe fn spawn_ptrace_tracer() {
         debug_log("ptrace child started");
         let _ = call_real_close(fds[0]);
         let _ = call_real_close(depth_fds[1]);
+        let _ = call_real_close(fgraph_window_fds[1]);
 
         // SAFETY: getppid has no preconditions.
         let target = unsafe { getppid() };
         debug_log(&format!("ptrace child attach target={target}"));
         // SAFETY: child owns tracer loop and exits independently.
-        unsafe { run_ptrace_loop(target, fds[1], fds[0], depth_fds[0], depth_fds[1]) };
+        unsafe {
+            run_ptrace_loop(
+                target,
+                fds[1],
+                fds[0],
+                depth_fds[0],
+                depth_fds[1],
+                fgraph_window_fds[0],
+                fgraph_window_fds[1],
+            )
+        };
         // SAFETY: hard exit to avoid returning into traced parent flow.
         unsafe { _exit(0) };
     }
 
     let _ = call_real_close(fds[1]);
     let _ = call_real_close(depth_fds[0]);
+    let _ = call_real_close(fgraph_window_fds[0]);
     let _ = set_nonblocking(depth_fds[1]);
+    let _ = set_nonblocking(fgraph_window_fds[1]);
     DEPTH_PIPE_WR_FD.store(depth_fds[1], Ordering::Relaxed);
+    FGRAPH_WINDOW_PIPE_WR_FD.store(fgraph_window_fds[1], Ordering::Relaxed);
 
     let mut ready = [0_u8; 1];
     // SAFETY: reading one byte handshake from tracer child.
@@ -488,6 +654,13 @@ unsafe fn spawn_ptrace_tracer() {
         if depth_fd >= 0 {
             let _ = call_real_close(depth_fd);
         }
+        let fgraph_fd = FGRAPH_WINDOW_PIPE_WR_FD.swap(-1, Ordering::Relaxed);
+        if fgraph_fd >= 0 {
+            let _ = call_real_close(fgraph_fd);
+        }
+        if global().fgraph_enabled() {
+            fatal_exit("function_graph tracing requested but ptrace tracer failed to initialize");
+        }
     }
     let _ = call_real_close(fds[0]);
 }
@@ -498,6 +671,8 @@ unsafe fn run_ptrace_loop(
     bootstrap_hidden_fd: i32,
     depth_read_fd: i32,
     depth_hidden_fd: i32,
+    fgraph_window_read_fd: i32,
+    fgraph_window_hidden_fd: i32,
 ) {
     if ptrace_attach(target).is_err() {
         debug_log_errno("ptrace attach failed");
@@ -520,13 +695,30 @@ unsafe fn run_ptrace_loop(
         return;
     }
 
+    let mut fgraph_controller = if global().fgraph_enabled() {
+        match crate::hook::fgraph::TraceFsController::init_or_fail() {
+            Ok(controller) => Some(controller),
+            Err(err) => {
+                debug_log(&format!("fgraph init failed: {err}"));
+                signal_ready(ready_fd, false);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     signal_ready(ready_fd, true);
     let _ = call_real_close(ready_fd);
 
     let _ = set_nonblocking(depth_read_fd);
+    let _ = set_nonblocking(fgraph_window_read_fd);
 
     let mut states: HashMap<pid_t, SyscallState> = HashMap::new();
     let mut depth_by_tid: HashMap<pid_t, usize> = HashMap::new();
+    let mut fgraph_window_by_tid: HashMap<pid_t, FgraphWindowState> = HashMap::new();
+    let mut active_fgraph_capture: Option<ActiveFgraphCapture> = None;
+    let mut waiting_fgraph_tids: VecDeque<pid_t> = VecDeque::new();
     let mut fd_paths: HashMap<i32, String> = HashMap::new();
     let mut hidden_fds: HashSet<i32> = HashSet::new();
     if bootstrap_hidden_fd >= 0 {
@@ -534,6 +726,9 @@ unsafe fn run_ptrace_loop(
     }
     if depth_hidden_fd >= 0 {
         hidden_fds.insert(depth_hidden_fd);
+    }
+    if fgraph_window_hidden_fd >= 0 {
+        hidden_fds.insert(fgraph_window_hidden_fd);
     }
     seed_fd_state_from_proc(target, &mut fd_paths, &mut hidden_fds);
     let mut cudatrace_ranges = load_cudatrace_ranges(target);
@@ -560,11 +755,33 @@ unsafe fn run_ptrace_loop(
             continue;
         }
         drain_depth_updates(depth_read_fd, &mut depth_by_tid);
+        drain_fgraph_window_updates(fgraph_window_read_fd, &mut fgraph_window_by_tid);
 
         if wifexited(status) || wifsignaled(status) {
+            if active_fgraph_capture
+                .as_ref()
+                .map(|capture| capture.tid == pid)
+                .unwrap_or(false)
+            {
+                let _ = finish_active_fgraph_capture(
+                    &mut fgraph_controller,
+                    &mut active_fgraph_capture,
+                    global().path.as_str(),
+                );
+            }
             states.remove(&pid);
             depth_by_tid.remove(&pid);
+            fgraph_window_by_tid.remove(&pid);
+            waiting_fgraph_tids.retain(|queued| *queued != pid);
             writer.close_tid(pid);
+            maybe_resume_waiting_fgraph_tid(
+                &mut waiting_fgraph_tids,
+                &mut states,
+                &fd_paths,
+                &fgraph_window_by_tid,
+                &mut fgraph_controller,
+                &mut active_fgraph_capture,
+            );
             continue;
         }
 
@@ -574,46 +791,102 @@ unsafe fn run_ptrace_loop(
 
         let sig = wstopsig(status);
         if sig == SYSCALL_STOP_SIG {
+            let mut hold_at_syscall_entry = false;
+            let mut finished_fgraph_capture = false;
             if let Ok(regs) = ptrace_getregs(pid) {
-                let state = states.entry(pid).or_default();
-                if !state.active {
-                    state.active = true;
-                    state.internal = is_internal_syscall(pid, &regs, &cudatrace_ranges);
-                    state.nr = regs.orig_rax as i64;
-                    state.args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
-                    state.path_hint = capture_path_hint(pid, state.nr, &state.args);
-                    state.started_ts = if global().left_meta.include_timestamp() {
-                        now_timestamp_for_config()
-                    } else {
-                        0
-                    };
-                    state.started_at = Instant::now();
-                } else {
-                    let ret_raw = regs.rax as i64;
-                    let ret_norm = normalize_ret(ret_raw);
+                {
+                    let state = states.entry(pid).or_default();
+                    if !state.active {
+                        state.active = true;
+                        state.internal = is_internal_syscall(pid, &regs, &cudatrace_ranges);
+                        state.nr = regs.orig_rax as i64;
+                        state.args = [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];
+                        state.path_hint = capture_path_hint(pid, state.nr, &state.args);
+                        state.started_ts = if global().left_meta.include_timestamp() {
+                            now_timestamp_for_config()
+                        } else {
+                            0
+                        };
+                        state.started_ts_us = now_timestamp_us();
+                        state.started_at = Instant::now();
+                        state.fgraph_waiting = false;
+                        state.fgraph_capturing = false;
 
-                    if !state.internal {
-                        let elapsed = state.started_at.elapsed();
-                        let depth = depth_by_tid.get(&pid).copied().unwrap_or(0);
-                        let line = format_syscall_line(
+                        if should_capture_fgraph(
                             pid,
                             state,
-                            ret_raw,
-                            elapsed,
-                            &fd_paths,
-                            &hidden_fds,
-                            depth,
-                        );
-                        if !line.is_empty() {
-                            writer.write_line(pid, &line);
+                            &fgraph_window_by_tid,
+                            &fgraph_controller,
+                        ) {
+                            if active_fgraph_capture.is_none() {
+                                state.fgraph_capturing = begin_fgraph_capture_for_state(
+                                    pid,
+                                    state,
+                                    &fd_paths,
+                                    &fgraph_window_by_tid,
+                                    &mut fgraph_controller,
+                                    &mut active_fgraph_capture,
+                                );
+                            } else {
+                                state.fgraph_waiting = true;
+                                if !waiting_fgraph_tids.contains(&pid) {
+                                    waiting_fgraph_tids.push_back(pid);
+                                }
+                                hold_at_syscall_entry = true;
+                            }
                         }
+                    } else {
+                        let ret_raw = regs.rax as i64;
+                        let ret_norm = normalize_ret(ret_raw);
+
+                        if state.fgraph_capturing {
+                            finished_fgraph_capture = true;
+                            state.fgraph_capturing = false;
+                        }
+
+                        if !state.internal {
+                            let elapsed = state.started_at.elapsed();
+                            let depth = depth_by_tid.get(&pid).copied().unwrap_or(0);
+                            let line = format_syscall_line(
+                                pid,
+                                state,
+                                ret_raw,
+                                elapsed,
+                                &fd_paths,
+                                &hidden_fds,
+                                depth,
+                            );
+                            if !line.is_empty() {
+                                writer.write_line(pid, &line);
+                            }
+                        }
+                        update_hidden_fds(pid, state, ret_norm, &mut hidden_fds);
+                        update_fd_paths(&mut fd_paths, state, ret_norm);
+                        state.active = false;
+                        state.internal = false;
+                        state.path_hint = None;
+                        state.started_ts_us = 0;
+                        state.fgraph_waiting = false;
                     }
-                    update_hidden_fds(pid, state, ret_norm, &mut hidden_fds);
-                    update_fd_paths(&mut fd_paths, state, ret_norm);
-                    state.active = false;
-                    state.internal = false;
-                    state.path_hint = None;
                 }
+            }
+            if hold_at_syscall_entry {
+                continue;
+            }
+            if finished_fgraph_capture {
+                let _ = finish_active_fgraph_capture(
+                    &mut fgraph_controller,
+                    &mut active_fgraph_capture,
+                    global().path.as_str(),
+                );
+                maybe_resume_waiting_fgraph_tid(
+                    &mut waiting_fgraph_tids,
+                    &mut states,
+                    &fd_paths,
+                    &fgraph_window_by_tid,
+                    &mut fgraph_controller,
+                    &mut active_fgraph_capture,
+                );
             }
             let _ = ptrace_syscall(pid, 0);
             continue;
@@ -649,7 +922,18 @@ unsafe fn run_ptrace_loop(
         let _ = ptrace_syscall(pid, sig);
     }
 
+    if active_fgraph_capture.is_some() {
+        let _ = finish_active_fgraph_capture(
+            &mut fgraph_controller,
+            &mut active_fgraph_capture,
+            global().path.as_str(),
+        );
+    }
+    if let Some(controller) = fgraph_controller.as_ref() {
+        let _ = controller.reset_state();
+    }
     let _ = call_real_close(depth_read_fd);
+    let _ = call_real_close(fgraph_window_read_fd);
 }
 
 fn signal_ready(fd: i32, ok: bool) {
@@ -788,6 +1072,16 @@ fn depth_update_as_bytes(msg: &DepthUpdate) -> &[u8] {
     }
 }
 
+fn fgraph_window_update_as_bytes(msg: &FgraphWindowUpdate) -> &[u8] {
+    // SAFETY: FgraphWindowUpdate is POD and we only expose its in-memory bytes for IPC.
+    unsafe {
+        std::slice::from_raw_parts(
+            (msg as *const FgraphWindowUpdate).cast::<u8>(),
+            std::mem::size_of::<FgraphWindowUpdate>(),
+        )
+    }
+}
+
 fn drain_depth_updates(fd: i32, depth_by_tid: &mut HashMap<pid_t, usize>) {
     if fd < 0 {
         return;
@@ -814,6 +1108,381 @@ fn drain_depth_updates(fd: i32, depth_by_tid: &mut HashMap<pid_t, usize>) {
             }
         }
         break;
+    }
+}
+
+fn drain_fgraph_window_updates(fd: i32, window_by_tid: &mut HashMap<pid_t, FgraphWindowState>) {
+    if fd < 0 {
+        return;
+    }
+    let mut msg = FgraphWindowUpdate::default();
+    let msg_size = std::mem::size_of::<FgraphWindowUpdate>();
+    loop {
+        let n = call_real_read(
+            fd,
+            (&mut msg as *mut FgraphWindowUpdate).cast::<crate::ffi::c_void>(),
+            msg_size,
+        );
+        if n == msg_size as isize {
+            apply_fgraph_window_update(&msg, window_by_tid);
+            continue;
+        }
+        if n < 0 {
+            let err = last_errno();
+            if err == EINTR {
+                continue;
+            }
+            if err == EAGAIN || err == EWOULDBLOCK {
+                break;
+            }
+        }
+        break;
+    }
+}
+
+fn apply_fgraph_window_update(
+    msg: &FgraphWindowUpdate,
+    window_by_tid: &mut HashMap<pid_t, FgraphWindowState>,
+) {
+    let depth = msg.depth as usize;
+    if msg.event == FGRAPH_WINDOW_EVENT_ENTER {
+        if depth == 0 {
+            window_by_tid.remove(&msg.tid);
+            return;
+        }
+        let state = window_by_tid.entry(msg.tid).or_default();
+        state.depth = depth;
+        state.labels.truncate(depth.saturating_sub(1));
+        state.labels.push(FgraphScopeLabel {
+            func: msg.func_name(),
+            seq: msg.seq,
+        });
+        return;
+    }
+
+    if depth == 0 {
+        window_by_tid.remove(&msg.tid);
+        return;
+    }
+    let state = window_by_tid.entry(msg.tid).or_default();
+    state.depth = depth;
+    state.labels.truncate(depth);
+}
+
+fn current_fgraph_scope_label(
+    tid: pid_t,
+    window_by_tid: &HashMap<pid_t, FgraphWindowState>,
+) -> Option<String> {
+    window_by_tid
+        .get(&tid)
+        .and_then(|state| state.labels.last())
+        .map(|label| format!("{}{}", label.func, label.seq))
+}
+
+fn now_timestamp_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+}
+
+fn should_capture_fgraph(
+    pid: pid_t,
+    state: &SyscallState,
+    window_by_tid: &HashMap<pid_t, FgraphWindowState>,
+    controller: &Option<crate::hook::fgraph::TraceFsController>,
+) -> bool {
+    controller.is_some()
+        && !state.internal
+        && window_by_tid
+            .get(&pid)
+            .map(|state| state.depth)
+            .unwrap_or(0)
+            > 0
+}
+
+fn begin_fgraph_capture_for_state(
+    pid: pid_t,
+    state: &SyscallState,
+    fd_paths: &HashMap<i32, String>,
+    window_by_tid: &HashMap<pid_t, FgraphWindowState>,
+    controller: &mut Option<crate::hook::fgraph::TraceFsController>,
+    active_capture: &mut Option<ActiveFgraphCapture>,
+) -> bool {
+    let Some(controller) = controller.as_ref() else {
+        return false;
+    };
+    let graph_function = syscall_graph_function(state.nr);
+    if let Err(err) = controller.begin_capture(pid, graph_function.as_deref()) {
+        log_fgraph_error(&format!(
+            "failed to begin function_graph capture for tid={pid}: {err}"
+        ));
+        return false;
+    }
+    let scope_label =
+        current_fgraph_scope_label(pid, window_by_tid).unwrap_or_else(|| "unknown0".to_owned());
+
+    *active_capture = Some(ActiveFgraphCapture {
+        tid: pid,
+        syscall_name: syscall_name(state.nr),
+        graph_function,
+        syscall_enter: format_fgraph_syscall_enter(pid, state, fd_paths),
+        entry_ts_us: state.started_ts_us,
+        scope_label,
+    });
+    true
+}
+
+fn finish_active_fgraph_capture(
+    controller: &mut Option<crate::hook::fgraph::TraceFsController>,
+    active_capture: &mut Option<ActiveFgraphCapture>,
+    base_path: &str,
+) -> Result<(), ()> {
+    let Some(capture) = active_capture.take() else {
+        return Ok(());
+    };
+    let Some(controller) = controller.as_ref() else {
+        return Ok(());
+    };
+
+    let graph = match controller.end_capture_and_read() {
+        Ok(graph) => graph,
+        Err(err) => {
+            log_fgraph_error(&format!(
+                "failed to finish function_graph capture for tid={}: {err}",
+                capture.tid
+            ));
+            let _ = controller.reset_state();
+            return Err(());
+        }
+    };
+
+    let path = fgraph_output_path(
+        base_path,
+        capture.tid,
+        &capture.syscall_name,
+        capture.entry_ts_us,
+        &capture.scope_label,
+    );
+    let mut out = String::new();
+    let _ = writeln!(
+        &mut out,
+        "tid={} syscall={} entry_ts_us={}",
+        capture.tid, capture.syscall_name, capture.entry_ts_us
+    );
+    let _ = writeln!(&mut out, "scope={}", capture.scope_label);
+    if let Some(graph_function) = capture.graph_function.as_deref() {
+        let _ = writeln!(&mut out, "graph_function={graph_function}");
+    }
+    let _ = writeln!(&mut out, "syscall_enter={}", capture.syscall_enter);
+    out.push_str(&sanitize_fgraph_trace_output(&graph));
+    if std::fs::write(&path, out.as_bytes()).is_err() {
+        log_fgraph_error(&format!("failed to write function_graph output: {path}"));
+        return Err(());
+    }
+    Ok(())
+}
+
+fn sanitize_fgraph_trace_output(graph: &str) -> String {
+    let mut out = String::with_capacity(graph.len());
+    let mut depth = 0_usize;
+    for line in graph.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("------------------------------------------") {
+            continue;
+        }
+        if line.contains("=>") {
+            continue;
+        }
+        let body = if let Some(idx) = line.find('|') {
+            let mut body = &line[idx + 1..];
+            if let Some(rest) = body.strip_prefix(' ') {
+                body = rest;
+            }
+            body.trim()
+        } else {
+            trimmed.trim()
+        };
+        if body.is_empty() {
+            continue;
+        }
+
+        if body.starts_with('}') {
+            depth = depth.saturating_sub(1);
+        }
+
+        out.push_str(&"\t".repeat(depth));
+        out.push_str(body);
+        out.push('\n');
+
+        if body.ends_with('{') {
+            depth = depth.saturating_add(1);
+        }
+    }
+    if out.is_empty() {
+        graph.to_owned()
+    } else {
+        out
+    }
+}
+
+fn format_fgraph_syscall_enter(
+    pid: pid_t,
+    state: &SyscallState,
+    fd_paths: &HashMap<i32, String>,
+) -> String {
+    match state.nr {
+        SYS_IOCTL => {
+            let fd = state.args[0] as i32;
+            let cmd = state.args[1];
+            let arg = state.args[2];
+            let fallback_path = if fd_paths.contains_key(&fd) {
+                None
+            } else {
+                read_live_fd_path(pid, fd)
+            };
+            let suffix = format_fd_suffix(
+                state
+                    .path_hint
+                    .as_deref()
+                    .or(fd_paths.get(&fd).map(String::as_str))
+                    .or(fallback_path.as_deref()),
+            );
+            format!("ioctl(fd={fd}{suffix}, cmd=0x{cmd:x}, arg=0x{arg:x})")
+        }
+        SYS_OPEN => {
+            let path = state.path_hint.as_deref().unwrap_or("<unreadable>");
+            let flags = format_open_flags(state.args[1]);
+            let mode = state.args[2];
+            format!("open(path=\"{path}\", flags={flags}, mode=0{mode:o})")
+        }
+        SYS_OPENAT => {
+            let dirfd = format_dirfd(state.args[0] as i32);
+            let path = state.path_hint.as_deref().unwrap_or("<unreadable>");
+            let flags = format_open_flags(state.args[2]);
+            let mode = state.args[3];
+            format!("openat(dirfd={dirfd}, path=\"{path}\", flags={flags}, mode=0{mode:o})")
+        }
+        SYS_CLOSE => {
+            let fd = state.args[0] as i32;
+            let fallback_path = if fd_paths.contains_key(&fd) {
+                None
+            } else {
+                read_live_fd_path(pid, fd)
+            };
+            let suffix = format_fd_suffix(
+                state
+                    .path_hint
+                    .as_deref()
+                    .or(fd_paths.get(&fd).map(String::as_str))
+                    .or(fallback_path.as_deref()),
+            );
+            format!("close(fd={fd}{suffix})")
+        }
+        _ => {
+            let name = syscall_name(state.nr);
+            format!(
+                "{name}(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x})",
+                state.args[0],
+                state.args[1],
+                state.args[2],
+                state.args[3],
+                state.args[4],
+                state.args[5]
+            )
+        }
+    }
+}
+
+fn maybe_resume_waiting_fgraph_tid(
+    waiting_tids: &mut VecDeque<pid_t>,
+    states: &mut HashMap<pid_t, SyscallState>,
+    fd_paths: &HashMap<i32, String>,
+    window_by_tid: &HashMap<pid_t, FgraphWindowState>,
+    controller: &mut Option<crate::hook::fgraph::TraceFsController>,
+    active_capture: &mut Option<ActiveFgraphCapture>,
+) {
+    if active_capture.is_some() {
+        return;
+    }
+
+    while let Some(tid) = waiting_tids.pop_front() {
+        let Some(state) = states.get_mut(&tid) else {
+            continue;
+        };
+        if !state.active || !state.fgraph_waiting {
+            continue;
+        }
+        state.fgraph_waiting = false;
+
+        if should_capture_fgraph(tid, state, window_by_tid, controller) {
+            state.fgraph_capturing = begin_fgraph_capture_for_state(
+                tid,
+                state,
+                fd_paths,
+                window_by_tid,
+                controller,
+                active_capture,
+            );
+        } else {
+            state.fgraph_capturing = false;
+        }
+
+        let _ = ptrace_syscall(tid, 0);
+        if active_capture.is_some() {
+            break;
+        }
+    }
+}
+
+fn fgraph_output_path(
+    base_path: &str,
+    tid: pid_t,
+    syscall: &str,
+    entry_ts_us: u128,
+    scope_label: &str,
+) -> String {
+    let scope = sanitize_scope_label_component(scope_label);
+    format!(
+        "{}.fgraph.tid-{}.ts-{}.{}.sys-{}.log",
+        base_path,
+        tid,
+        entry_ts_us,
+        scope,
+        sanitize_file_component(syscall)
+    )
+}
+
+fn syscall_graph_function(nr: i64) -> Option<String> {
+    let name = syscall_name(nr);
+    if name.starts_with("syscall_") {
+        return None;
+    }
+    Some(format!("__x64_sys_{name}"))
+}
+
+fn sanitize_file_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn sanitize_scope_label_component(input: &str) -> String {
+    let cleaned = sanitize_file_component(input);
+    if cleaned.is_empty() {
+        "unknown0".to_owned()
+    } else {
+        cleaned
     }
 }
 
@@ -1309,11 +1978,7 @@ fn format_syscall_line(
                 state
                     .path_hint
                     .as_deref()
-                    .or(
-                        fd_paths
-                    .get(&fd)
-                            .map(String::as_str),
-                    )
+                    .or(fd_paths.get(&fd).map(String::as_str))
                     .or(fallback_path.as_deref()),
             );
             format!(
@@ -1838,7 +2503,7 @@ fn indent_ptrace_line(line: String, depth: usize) -> String {
     if !(cfg.trace.cudart || cfg.trace.driver) || depth == 0 {
         line
     } else {
-        format!("{}{}", "  ".repeat(depth), line)
+        format!("{}{}", "\t".repeat(depth), line)
     }
 }
 
@@ -1943,6 +2608,17 @@ fn debug_log_errno(msg: &str) {
         return;
     }
     debug_log(&format!("{msg}: errno={}", last_errno()));
+}
+
+fn log_fgraph_error(msg: &str) {
+    let mut line = String::new();
+    let _ = writeln!(&mut line, "[cudatrace-fgraph] {msg}");
+    let _ = write_all(crate::ffi::STDERR_FILENO, line.as_bytes());
+}
+
+fn fatal_exit(msg: &str) -> ! {
+    log_fgraph_error(msg);
+    std::process::exit(1)
 }
 
 #[cfg(test)]
@@ -2064,5 +2740,68 @@ mod tests {
         let pid = unsafe { crate::ffi::getpid() };
         let hint = capture_path_hint(pid, SYS_CLOSE, &args).expect("close path hint");
         assert!(hint.contains("/dev/null"));
+    }
+
+    #[test]
+    fn fgraph_output_path_uses_required_dimensions() {
+        let path = fgraph_output_path("./cudatrace.output", 42, "ioctl", 123456, "cudaMalloc2");
+        assert_eq!(
+            path,
+            "./cudatrace.output.fgraph.tid-42.ts-123456.cudaMalloc2.sys-ioctl.log"
+        );
+    }
+
+    #[test]
+    fn sanitize_file_component_replaces_unsafe_chars() {
+        assert_eq!(sanitize_file_component("syscall/name:1"), "syscall_name_1");
+    }
+
+    #[test]
+    fn sanitize_scope_label_component_falls_back_when_empty() {
+        assert_eq!(sanitize_scope_label_component(""), "unknown0");
+    }
+
+    #[test]
+    fn sanitize_fgraph_trace_output_drops_context_switch_lines() {
+        let raw = "\
+# tracer: function_graph\n\
+ # CPU  DURATION                  FUNCTION CALLS\n\
+ ------------------------------------------\n\
+  4)    <idle>-0    =>  cudart-1 \n\
+  4)   0.301 us    | __x64_sys_ioctl() {\n\
+  4)   0.120 us    |   fdget();\n\
+";
+        let cleaned = sanitize_fgraph_trace_output(raw);
+        assert!(!cleaned.contains("# tracer"));
+        assert!(!cleaned.contains("=>"));
+        assert!(!cleaned.contains("------------------------------------------"));
+        let mut lines = cleaned.lines();
+        assert_eq!(lines.next().unwrap_or_default(), "__x64_sys_ioctl() {");
+        assert_eq!(lines.next().unwrap_or_default(), "\tfdget();");
+    }
+
+    #[test]
+    fn format_fgraph_syscall_enter_ioctl_contains_key_args() {
+        let mut fd_paths = HashMap::new();
+        fd_paths.insert(7, "/dev/nvidiactl".to_owned());
+
+        let state = SyscallState {
+            nr: SYS_IOCTL,
+            args: [7, 0xdeadbeef, 0x1234, 0, 0, 0],
+            ..Default::default()
+        };
+        let line = format_fgraph_syscall_enter(0, &state, &fd_paths);
+        assert!(line.contains("ioctl(fd=7"));
+        assert!(line.contains("cmd=0xdeadbeef"));
+        assert!(line.contains("arg=0x1234"));
+        assert!(line.contains("/dev/nvidiactl"));
+    }
+
+    #[test]
+    fn syscall_graph_function_maps_known_syscall() {
+        assert_eq!(
+            syscall_graph_function(SYS_IOCTL).as_deref(),
+            Some("__x64_sys_ioctl")
+        );
     }
 }
